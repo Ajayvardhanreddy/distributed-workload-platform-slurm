@@ -1,0 +1,40 @@
+# NOTE: git does NOT strip trailing inline comments. Keep every comment on its
+# own line so patterns like "*.tfstate" match literally.
+
+# ===== Terraform =====
+# Provider/plugin cache (downloaded by `terraform init`)
+.terraform/
+.terraform.tfstate.lock.info
+# State can contain secrets, AWS account IDs, IPs, public keys — NEVER commit
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Real variable values (your public IP, key paths). Keep the *.example tracked.
+terraform.tfvars
+!terraform.tfvars.example
+
+# .terraform.lock.hcl is intentionally NOT ignored — commit it to pin providers.
+
+# ===== Secrets / keys (defense in depth; real keys live in ~/.ssh, not here) =====
+*.pem
+*.key
+munge.key
+.env
+*.env
+
+# ===== Logs / job output =====
+*.log
+*-*.out
+
+# ===== macOS / editors =====
+.DS_Store
+.vscode/
+.idea/
+
+# ===== Local-only docs (not published) =====
+CLAUDE.md
+PROJECT_GUIDE.md
+docs/interview-notes.md
