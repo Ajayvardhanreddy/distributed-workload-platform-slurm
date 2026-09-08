@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  terraform:
+    name: terraform fmt + validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+      - name: fmt check
+        run: terraform fmt -check -recursive
+      - name: init (no backend, no AWS creds needed)
+        run: terraform init -backend=false
+      - name: validate
+        run: terraform validate
+
+  scripts:
+    name: shellcheck + bash syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck scripts (fail on errors)
+        run: shellcheck --severity=error scripts/*.sh
+      - name: bash syntax-check job scripts
+        run: for f in jobs/*.sbatch; do bash -n "$f"; done
