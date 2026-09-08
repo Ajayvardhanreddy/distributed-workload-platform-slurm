@@ -283,3 +283,8 @@ This cluster is deliberately minimal. A production EDA/HPC farm would add:
 
 Being able to draw that lab→production line — and explain *why each piece exists* — is the point of
 the project.
+
+> **Going further:** the full production-scale evolution of this design — zero-touch provisioning,
+> fleet lifecycle management, federated scheduler cells, health/remediation, safe rollouts,
+> multi-site/DR, and how to validate control-plane behavior against a simulated 100,000-node fleet —
+> is written up in **[`docs/PRODUCTION_SCALE_ARCHITECTURE.md`](docs/PRODUCTION_SCALE_ARCHITECTURE.md)**.
