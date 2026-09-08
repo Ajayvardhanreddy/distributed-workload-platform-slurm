@@ -1,13 +1,12 @@
-# Distributed Workload Platform — Mini EDA Compute Farm on AWS with SLURM
+# Distributed Workload Platform with Slurm
 
-A **multi-node Linux compute cluster** built from scratch on AWS and driven by the **SLURM**
-workload manager — provisioned with Terraform, secured with MUNGE, and isolated with cgroups.
-The goal wasn't to copy a tutorial; it was to **build, operate, deliberately break, and recover**
-a real batch-scheduling system the way an HPC / EDA infrastructure team runs a compute farm.
+A multi-node **batch scheduling and cluster reliability platform** on AWS, with EDA-style
+workloads for resource contention, parameter sweeps, dependency pipelines, and node
+failure/recovery. Provisioned with Terraform, authenticated with MUNGE, isolated with cgroups.
 
-> **Scope:** an intentionally small, low-cost **learning cluster** (1 controller + 2 compute nodes).
-> It favors visibility and hands-on failure drills over production HA/scale. Where a design choice
-> differs from production, the README says so explicitly.
+Three-node learning deployment — built to operate, deliberately break, and recover a real
+scheduler the way an HPC/EDA infrastructure team runs a compute farm. Where a design choice
+differs from production, this README says so explicitly.
 
 **Stack:** AWS (VPC/EC2) · Terraform · Ubuntu 24.04 · SLURM 23.11 · MUNGE · cgroups v2 · Bash
 
