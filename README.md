@@ -10,6 +10,11 @@ differs from production, this README says so explicitly.
 
 **Stack:** AWS (VPC/EC2) · Terraform · Ubuntu 24.04 · SLURM 23.11 · MUNGE · cgroups v2 · Bash
 
+> **Scaling this to a 100,000-machine fleet →** the production evolution of this design — zero-touch
+> provisioning, fleet lifecycle management, federated scheduler cells, health/remediation, safe
+> rollouts, multi-site/DR, and validating control-plane behavior against a simulated 100k-node fleet —
+> is written up in **[`docs/PRODUCTION_SCALE_ARCHITECTURE.md`](docs/PRODUCTION_SCALE_ARCHITECTURE.md)**.
+
 ---
 
 ## Table of contents
@@ -282,9 +287,5 @@ This cluster is deliberately minimal. A production EDA/HPC farm would add:
 | Observability | `sinfo`/`squeue`/logs | Prometheus/Grafana, centralized logging, health dashboards |
 
 Being able to draw that lab→production line — and explain *why each piece exists* — is the point of
-the project.
-
-> **Going further:** the full production-scale evolution of this design — zero-touch provisioning,
-> fleet lifecycle management, federated scheduler cells, health/remediation, safe rollouts,
-> multi-site/DR, and how to validate control-plane behavior against a simulated 100,000-node fleet —
-> is written up in **[`docs/PRODUCTION_SCALE_ARCHITECTURE.md`](docs/PRODUCTION_SCALE_ARCHITECTURE.md)**.
+the project. See **[`docs/PRODUCTION_SCALE_ARCHITECTURE.md`](docs/PRODUCTION_SCALE_ARCHITECTURE.md)**
+for the full production-scale evolution.
