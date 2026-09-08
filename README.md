@@ -44,9 +44,12 @@ differs from production, this README says so explicitly.
 
 ## Architecture
 
+The **Slurm control plane** is `slurmctld` on the controller. The laptop is only the
+operator/provisioning plane (Terraform + CLI + SSH) — it is not part of the running cluster.
+
 ```mermaid
 flowchart TB
-    subgraph LAP["Laptop · control plane"]
+    subgraph LAP["Laptop · operator / provisioning plane"]
       TF["Terraform"]
       CLI["AWS CLI · SSH"]
     end
@@ -55,7 +58,7 @@ flowchart TB
       subgraph VPC["VPC 10.20.0.0/16"]
         IGW["Internet Gateway"]
         subgraph SUB["Public subnet 10.20.1.0/24"]
-          CTL["controller · 10.20.1.10<br/>slurmctld + MUNGE<br/>scheduler & cluster state"]
+          CTL["controller · 10.20.1.10<br/>slurmctld + MUNGE<br/>CONTROL PLANE: scheduler & cluster state"]
           N1["compute-01 · 10.20.1.11<br/>slurmd + MUNGE + cgroups"]
           N2["compute-02 · 10.20.1.12<br/>slurmd + MUNGE + cgroups"]
         end
@@ -71,7 +74,7 @@ flowchart TB
 
 | Component | Role |
 |---|---|
-| **controller** (`slurmctld`) | The brain. Owns all cluster state — node states, the job queue, allocations. Makes every scheduling decision. Runs as unprivileged `slurm`. |
+| **controller** (`slurmctld`) | The control plane. Owns all cluster state — node states, the job queue, allocations. Makes every scheduling decision. Runs as unprivileged `slurm`. |
 | **compute nodes** (`slurmd`) | The workers. Register resources, launch job steps (via a per-step `slurmstepd`), enforce cgroup limits, heartbeat state back. Run as `root`. |
 | **MUNGE** | Shared-key credential service. A credential minted on one node is verifiable on any other — this authenticates every SLURM RPC. |
 | **cgroups v2** | Kernel-level enforcement of each job's CPU/memory allocation (the difference between *scheduling* and *isolation*). |
@@ -105,18 +108,25 @@ down the node's other work.
 
 ## Reliability: health-check drain & recovery
 
-Each node checks *itself* on a timer and drains itself when unhealthy — the controller is never a
-polling bottleneck (this is what lets the pattern scale to thousands of nodes).
+Each node runs the check **locally** on a timer and drains itself when unhealthy — the controller
+doesn't synchronously poll every machine, which keeps this pattern viable as the fleet grows (though
+`slurmctld` itself remains the control-plane component you'd scale most carefully).
 
 ```mermaid
 flowchart LR
     A["slurmd runs HealthCheckProgram<br/>every 30s — on the node itself"] -->|exit 0| B["healthy · stays idle"]
     A -->|"fault detected"| C["scontrol update State=DRAIN<br/>reason = healthcheck:..."]
-    C --> D["scheduler places<br/>NO new work here<br/>(running jobs finish)"]
+    C --> D["scheduler places<br/>NO new work here<br/>(running jobs not evicted)"]
     D --> E["operator repairs & verifies"]
     E --> F["manual RESUME<br/>(deliberately NOT automatic)"]
     F --> B
 ```
+
+**DRAIN ≠ repair.** Draining stops *new* placement; it does **not** evict already-running jobs.
+Whether those jobs survive depends on *why* you drained: planned maintenance → they usually finish;
+a real fault (dead DIMM, GPU fell off the bus, bad scratch disk) → they may still fail, because the
+scheduler state doesn't heal the hardware. Draining buys control over *scheduling*, not a guarantee
+about running work.
 
 **Why recovery is manual:** auto-resuming on the first healthy check invites *flapping* — an
 intermittently-bad node would drain → pass one check → resume → fail again. Draining is cheap to
@@ -134,10 +144,10 @@ Every scenario below was run on the live cluster and its behavior observed and e
 | Multi-node execution | `srun -N2 -n2 hostname` | task ran on **both** compute nodes |
 | **Scheduling vs enforcement** | `srun --cpus-per-task=1 … nproc` | task sees **1** CPU (its *allocation*), not 2 (the *hardware*) — cgroup/affinity enforced |
 | Resource contention | 3× `--exclusive` on 2 nodes | 2 `RUNNING`, 1 `PENDING (Resources)`; queued job **auto-starts** when a node frees |
-| Job arrays (throughput control) | `--array=0-19%2` | 20 tasks throttled to 2 concurrent (`JobArrayTaskLimit`) — maps to EDA license limits |
+| Job arrays (throughput control) | `--array=0-19%2` | 20 tasks throttled to 2 concurrent (`JobArrayTaskLimit`) — **bounded concurrency, analogous to** (not the same mechanism as) a real license scheduler |
 | Dependency pipeline | `--dependency=afterok:` chain | synth → timing → verify run **strictly in order** even with idle nodes |
 | Failure propagation | synth `exit 1` | downstream jobs → `DependencyNeverSatisfied`; pipeline halts (don't verify a failed synth) |
-| Planned maintenance | `scontrol … State=DRAIN / RESUME` | new work avoids the node; **running jobs keep running** |
+| Planned maintenance | `scontrol … State=DRAIN / RESUME` | new work avoids the node; running jobs are **not evicted** by the drain (a real fault could still fail them) |
 | Node failure | `systemctl stop slurmd` | node → `DOWN+NOT_RESPONDING` after `SlurmdTimeout`; **auto-recovers** on restart (`ReturnToService=2`) |
 | Automated remediation | health check + injected fault | node **self-drains in ~30s**; controlled manual recovery |
 
@@ -155,8 +165,9 @@ enforcement *off* and no accounting database. Instead of guessing, I diagnosed b
    **backfill scheduler places them ~10–30s later** — jobs were never stuck; my checks were just
    faster than the backfill cycle. Interactive `srun`/`salloc` were unaffected.
 4. Fix for the lab: lean on backfill and tighten it (`SchedulerParameters=bf_interval=5`); the
-   "proper" fix is `slurmdbd` with real accounts. (Also caught two invalid `slurm.conf` params along
-   the way that crash `slurmctld` — `AccountingStorageEnforce=none` and `HealthCheckTimeout`.)
+   "proper" fix is `slurmdbd` with real accounts. (Also learned that `AccountingStorageEnforce=none`
+   is an **invalid value** — the parser rejects the literal `none` and refuses to start `slurmctld`;
+   the correct form is to simply omit the line, since no-enforcement is the default.)
 
 Takeaway: *"pending jobs with idle nodes"* is a classic ops ticket — root-caused here to the
 main-vs-backfill scheduler split and an empty association manager, using logs rather than trial-and-error.
@@ -167,21 +178,22 @@ main-vs-backfill scheduler split and an empty association manager, using logs ra
 
 ```
 .
-├── infra/terraform/        # IaC: VPC, subnet, IGW, route table, SG, key pair, 3× EC2
-│   ├── versions.tf         #   providers + pinning
-│   ├── variables.tf        #   inputs (SSH CIDR has no default — must be set consciously)
-│   ├── main.tf             #   all AWS resources + cloud-init (hostname + /etc/hosts)
-│   ├── outputs.tf          #   public IPs + ready-to-paste SSH commands
+├── .github/workflows/ci.yml   # fmt -check, validate, shellcheck, bash -n (no AWS needed)
+├── infra/terraform/           # IaC: VPC, subnet, IGW, route table, SG, key pair, 3× EC2
+│   ├── versions.tf            #   providers + pinning
+│   ├── variables.tf           #   inputs; allowed_ssh_cidr enforced to a /32 via validation{}
+│   ├── main.tf                #   all AWS resources + cloud-init (hostname + /etc/hosts)
+│   ├── outputs.tf             #   public IPs + ready-to-paste SSH commands
 │   └── terraform.tfvars.example
 ├── config/
-│   ├── slurm.conf          # cluster identity, cons_tres, cgroups, partition, health check
-│   └── cgroup.conf         # ConstrainCores / ConstrainRAMSpace
-├── jobs/                   # EDA-style workloads
+│   ├── slurm.conf             # cluster identity, cons_tres, cgroups, partition, health check
+│   └── cgroup.conf            # ConstrainCores / ConstrainRAMSpace
+├── jobs/                      # EDA-style workloads
 │   ├── hello.sbatch  exclusive.sbatch  sweep.sbatch   (basics, contention, array sweep)
 │   └── synth.sbatch  timing.sbatch  verify.sbatch  synth_fail.sbatch   (dependency pipeline)
 ├── scripts/
 │   ├── slurm-healthcheck.sh   # per-node self-check → auto-drain
-│   └── update-ssh-ip.sh       # re-point the SSH security-group rule at your current IP
+│   └── update-ssh-ip.sh       # re-point the SSH security-group rule at your current IP (plan → confirm)
 └── README.md
 ```
 
@@ -205,15 +217,18 @@ sinfo                    # → two idle nodes in the 'eda' partition
 srun -N2 -n2 hostname    # → runs on both compute nodes
 ```
 
+> Cluster software (MUNGE/SLURM) is configured manually — a deliberate learning choice so every
+> component is understood. The natural V2 is to automate that bootstrap (Ansible / baked image).
+
 ---
 
 ## Operations
 
 ```bash
 # SSH hangs / times out (your public IP changed — moved networks / ISP re-assigned):
-./scripts/update-ssh-ip.sh          # detects current IP, updates only the SG rule
+./scripts/update-ssh-ip.sh          # detects current IP, shows a Terraform plan, applies on confirmation
 
-# Stop for the night (halts compute charges; keeps disks + all config):
+# Stop for the night (halts compute + public-IPv4 charges; keeps disks + all config):
 aws ec2 stop-instances --instance-ids $(aws ec2 describe-instances \
   --filters "Name=tag:Project,Values=slurm-eda-lab" "Name=instance-state-name,Values=running" \
   --query "Reservations[].Instances[].InstanceId" --output text)
@@ -222,7 +237,7 @@ aws ec2 stop-instances --instance-ids $(aws ec2 describe-instances \
 aws ec2 start-instances --instance-ids $(aws ec2 describe-instances \
   --filters "Name=tag:Project,Values=slurm-eda-lab" "Name=instance-state-name,Values=stopped" \
   --query "Reservations[].Instances[].InstanceId" --output text)
-cd infra/terraform && terraform refresh >/dev/null && terraform output && cd ..
+cd infra/terraform && terraform apply -refresh-only && terraform output && cd ..   # refresh state → new public IPs
 ./scripts/update-ssh-ip.sh
 
 # Tear it all down ($0 after):
@@ -234,15 +249,19 @@ cd infra/terraform && terraform destroy
 ## Security & cost model
 
 **Security**
-- SSH is restricted to a **single `/32`** (your IP) — never `0.0.0.0/0`. Intra-cluster traffic is
-  allowed only *between members of the security group*, not from any CIDR.
+- SSH is restricted to a **single `/32`** (your IP) — never `0.0.0.0/0`, and that invariant is
+  **enforced in code** by a Terraform `validation{}` block on `allowed_ssh_cidr`, not just a comment.
+  Intra-cluster traffic is allowed only *between members of the security group*, not from any CIDR.
 - IMDSv2 required (`http_tokens = "required"`); encrypted EBS.
 - **Nothing sensitive is committed:** Terraform state, `terraform.tfvars` (your IP), SSH private
   keys, and `munge.key` are all git-ignored. The SSH *public* key is read from `~/.ssh` at apply
   time, never stored in the repo.
+- `update-ssh-ip.sh` shows a plan and waits for confirmation — it never `-auto-approve`s an infra change.
 
-**Cost** — three `t3.micro` ≈ **$0.03/hr** total while running (a few cents per work session).
-No NAT gateway, EFS/FSx, GPU, or multi-AZ. `terraform destroy` (or `stop`) when idle.
+**Cost (us-east-1, approximate)** — 3× `t3.micro` ≈ **$0.031/hr** compute, plus **~$0.015/hr** for
+three public IPv4 addresses (AWS bills ~$0.005/hr each since Feb 2024), plus EBS (~$2/mo for three
+8 GB gp3 volumes). So ≈ **$0.05/hr while running**; **stopped** ≈ **~$2/mo** (compute and public-IP
+charges drop, EBS remains). No NAT gateway, EFS/FSx, GPU, or multi-AZ. `terraform destroy` when done.
 
 ---
 
@@ -258,7 +277,8 @@ This cluster is deliberately minimal. A production EDA/HPC farm would add:
 | Accounting | none | `slurmdbd` + database (`sacct`, fair-share, chargeback) |
 | Storage | node-local disk | shared FS (NFS/Lustre/GPFS/FSx) for tools + design data |
 | Nodes | 2× identical `t3.micro` | heterogeneous CPU/high-mem/GPU partitions, at scale |
-| Provisioning | Terraform + manual config | Terraform + Ansible/images, autoscaling, node lifecycle automation |
+| Provisioning | Terraform + manual cluster config | Terraform + Ansible/baked images, autoscaling, node lifecycle automation |
+| Terraform state | local file, git-ignored | remote encrypted backend (e.g. S3 + DynamoDB lock, or TF Cloud) with locking + access control |
 | Observability | `sinfo`/`squeue`/logs | Prometheus/Grafana, centralized logging, health dashboards |
 
 Being able to draw that lab→production line — and explain *why each piece exists* — is the point of

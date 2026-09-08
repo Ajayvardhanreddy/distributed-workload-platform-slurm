@@ -5,8 +5,19 @@ variable "aws_region" {
 }
 
 variable "allowed_ssh_cidr" {
-  description = "Your public IP in CIDR form, e.g. 1.2.3.4/32. NEVER set this to 0.0.0.0/0."
+  description = "Your public IP as a single-host CIDR, e.g. 1.2.3.4/32. Must be a /32; 0.0.0.0/0 is rejected."
   type        = string
+
+  # Encode the security invariant in code, not just a comment: reject anything that
+  # isn't a valid single-host (/32) CIDR — in particular a world-open 0.0.0.0/0.
+  validation {
+    condition = (
+      can(cidrnetmask(var.allowed_ssh_cidr)) &&
+      endswith(var.allowed_ssh_cidr, "/32") &&
+      var.allowed_ssh_cidr != "0.0.0.0/0"
+    )
+    error_message = "allowed_ssh_cidr must be a valid single-host CIDR ending in /32 (e.g. 203.0.113.10/32) — never a broad range like 0.0.0.0/0."
+  }
 }
 
 variable "public_key_path" {
