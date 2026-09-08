@@ -12,7 +12,7 @@ differs from production, this README says so explicitly.
 
 > **Scaling this to a 100,000-machine fleet →** the production evolution of this design — zero-touch
 > provisioning, fleet lifecycle management, federated scheduler cells, health/remediation, safe
-> rollouts, multi-site/DR, and validating control-plane behavior against a simulated 100k-node fleet —
+> rollouts, multi-site/DR, and a strategy for validating control-plane behavior against a simulated 100k-node fleet —
 > is written up in **[`docs/PRODUCTION_SCALE_ARCHITECTURE.md`](docs/PRODUCTION_SCALE_ARCHITECTURE.md)**.
 
 ---
@@ -106,8 +106,9 @@ sequenceDiagram
 ```
 
 `slurmd` is a lightweight, always-up daemon; it forks a **separate `slurmstepd` per job step** that
-owns the cgroup, drops privileges, wires I/O, and reaps the task — so one misbehaving step can't take
-down the node's other work.
+owns the cgroup, drops privileges, wires I/O, and reaps the task — giving per-step isolation,
+accounting, and signal handling and reducing cross-job interference (jobs still share the node's
+kernel, disk, network, and hardware).
 
 ---
 
@@ -199,6 +200,8 @@ main-vs-backfill scheduler split and an empty association manager, using logs ra
 ├── scripts/
 │   ├── slurm-healthcheck.sh   # per-node self-check → auto-drain
 │   └── update-ssh-ip.sh       # re-point the SSH security-group rule at your current IP (plan → confirm)
+├── docs/
+│   └── PRODUCTION_SCALE_ARCHITECTURE.md   # scaling design: 3 nodes → 100k-machine platform
 └── README.md
 ```
 

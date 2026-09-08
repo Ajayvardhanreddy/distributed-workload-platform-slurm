@@ -10,7 +10,10 @@
 >
 > It is a **design + reasoning** document, not a claim that I ran 100k nodes. Everything is derived from
 > first principles and from the mechanisms proven at small scale in the lab. It is written to be
-> defended out loud, with explicit tradeoffs — the way a staff engineer reasons, not a feature list.
+> defended out loud, with explicit tradeoffs — reasoning-first, not a feature list.
+>
+> **Built vs designed:** V1 (the 3-node lab) is built and tested. Everything labelled V2–V5 here is
+> *designed*, not yet implemented — the roadmap in §21 is explicit about which is which.
 >
 > Vendor-agnostic on purpose: the concepts (control planes, reconciliation, cells, remediation)
 > apply whether the scheduler is Slurm, LSF, or something else.
@@ -70,9 +73,8 @@ Cross-cutting truths that dominate the architecture:
 - **Thousands of humans submit concurrently**, with bursty regressions that fan out to millions of
   tasks in seconds. The *submission and queue path* must absorb bursts without melting the controller.
 
-**Talking point:** *"I design the platform around the workload: EDA is a mix of massive CPU-throughput
-regressions, memory-bound long-lived P&R jobs, and license-gated tool runs over huge shared data. That
-mix — not raw node count — dictates the scheduling, storage, and reliability design."*
+The design consequence: this mix of workloads — **not raw node count** — dictates the scheduling,
+storage, and reliability choices throughout the rest of this document.
 
 ---
 
@@ -87,7 +89,7 @@ The jump from 3 nodes to 100,000 isn't quantitative, it's qualitative — severa
 | Human effort | one person SSHes | on-call **cannot** scale linearly with nodes → **toil reduction is survival**, remediation must be autonomous |
 | Name resolution | `/etc/hosts` | DNS + IPAM + service discovery |
 | Config delivery | `scp` one file | config-as-code + validation + **staged rollout** (a bad config pushed to 100k nodes at once is an outage) |
-| Scheduler | one `slurmctld` | **federated cells**, each with HA + accounting DB; one control plane can't own 100k nodes + burst submission |
+| Scheduler | one `slurmctld` | **federated scheduler cells**, each with HA + accounting DB; a single control plane has finite RPC/scheduling-cycle limits and is one failure domain |
 | Failure blast radius | one node | node → rack → row → AZ → datacenter → region; design must **contain** each |
 | State truth | look at `sinfo` | an **inventory/reconciliation system** is the source of truth; `sinfo` is one input |
 
@@ -133,7 +135,7 @@ flowchart TB
         LOGIN["login + submit API<br/>authN/authZ · quotas · rate-limit / backpressure"]
     end
     subgraph P3["③ Scheduler control plane — federated cells"]
-        FED["global routing · fair-share · federation"]
+        FED["global admission / routing · cross-cell fair-share"]
         CELLS["Cell(CPU) · Cell(GPU) · Cell(high-mem)<br/>each: controller + hot standby + accounting DB"]
     end
     subgraph P4["④ Execution plane — ~100k nodes"]
@@ -173,17 +175,16 @@ flowchart TB
 | Plane | Single responsibility | State it owns | Scale concern at 100k |
 |---|---|---|---|
 | ② Access | authenticate, admit, throttle | sessions, quotas | burst submission; must shed load, not fall over |
-| ③ Scheduler | decide *where* work runs | queue, allocations, node states | one controller can't own 100k → **cells + federation**; HA |
+| ③ Scheduler | decide *where* work runs | queue, allocations, node states | a single controller has finite RPC/cycle limits & is one failure domain → **cells + a routing layer**; HA |
 | ④ Execution | run & isolate the work | per-node running steps | node-local only → fails independently (good) |
 | ⑤ Lifecycle | keep the fleet in its desired state | inventory, desired vs actual | reconcile rate; avoid remediation storms |
 | ⑥ Prov/Config | make nodes exist & be correct | infra state, config versions | a bad push is a fleet-wide outage → staged rollout |
 | ⑦ Data | serve tools/design data/licenses | files, tokens | metadata storms, throughput, license starvation |
 | ⑧ Observability | explain the system | metrics/logs/events/audit | cardinality; don't let telemetry outgrow the fleet |
 
-**Talking point:** *"I don't think of it as 'a big Slurm cluster'. I think of it as planes with clean
-seams — scheduling, execution, lifecycle, config, data, observability — each owning one kind of state
-and scaling independently. The scheduler decides *where*; a separate lifecycle control plane keeps the
-*fleet itself* in a desired state. Conflating those two is how you get a system nobody can operate."*
+The key seam: the **scheduler decides *where* work runs**, while a **separate lifecycle control plane
+keeps the *fleet itself* in its desired state**. Conflating those two produces a system nobody can
+operate — keeping them apart is what lets each scale and fail independently.
 
 ---
 
@@ -215,70 +216,84 @@ Why this framing matters:
 - **The controller is stateless-ish about actions, authoritative about intent.** Desired state lives in
   version control / inventory; actual state is observed; the loop is the bridge.
 
-**Talking point:** *"I'd model fleet management as reconciliation, not automation scripts. Desired state
-is declared and version-controlled; a control loop observes actual state, diffs, and takes the smallest
-idempotent action to converge, then verifies. That's why it survives controller restarts and scales:
-adding nodes adds objects to reconcile, not new bespoke scripts."*
+This is why the platform scales: adding nodes adds *objects to reconcile*, not new bespoke scripts — and
+why it survives controller restarts, since intent is version-controlled and actions are idempotent.
 
 ---
 
 ## 6. Scheduler control plane: one → cells → federation
 
 **Problem:** a single scheduler controller (`slurmctld`, or an LSF master) has finite limits — RPC
-throughput, scheduling-cycle time, memory for job/node objects, and a single failure domain. It
-comfortably handles thousands of nodes and high job churn, but **not** 100k nodes plus millions of
-queued array tasks plus thousands of concurrent submitters.
+throughput, scheduling-cycle time, memory for job/node objects — and it is a single failure domain.
+There is **no universal node count** at which it "runs out": pressure is driven by job count, submission
+rate, completion/churn, RPC rate, scheduling complexity, topology, and plugins as much as by raw node
+count. A 10k-node cluster running long jobs can be gentler on the controller than a 2k-node cluster
+churning hundreds of tiny jobs per second. (Slurm mitigates fan-out with hierarchical node
+communication.) So the trigger to split is **measured**, not a magic number.
 
-**Design:** partition the fleet into **cells** (independent scheduler instances), each owning a few
-thousand to ~10k nodes, fronted by a **federation / routing layer** that presents one logical service
-and enforces global fair-share and quotas. Cells are also a natural **capability boundary** (CPU / GPU
-/ high-mem) and a **failure-isolation boundary** (a cell outage ≠ a fleet outage).
+**Design:** when measured scheduler-cycle time, RPC throughput, or queue depth degrade — or simply for
+**failure isolation** and **capability boundaries** — partition the fleet into **cells** (independent
+scheduler clusters). Two concerns are easy to conflate, and I'd keep them separate:
+
+- **A global admission / routing layer** (something I would build): owns global policy — quotas,
+  cross-cell fair-share, backpressure, and routing each submission to an appropriate cell. It is *not*
+  a scheduler; it places *workload onto cells*.
+- **Native scheduler federation** (e.g. Slurm's): peer-to-peer coordination *between* clusters. Being
+  precise: Slurm federation is peer-to-peer (a job originates on one cluster, sibling jobs may be made
+  on eligible clusters, each schedules independently), it is explicitly **not** aimed at high-throughput,
+  and job arrays currently run only on their origin cluster. So I'd use native federation where it
+  helps, but not assume it provides global admission, fairness, or high-throughput routing — those live
+  in the layer above.
 
 ```mermaid
 flowchart TB
-    GS["Global submit + routing layer<br/>federation · global fair-share · quotas · backpressure"]
+    GS["Global admission / routing layer<br/>quotas · cross-cell fair-share · backpressure · route workload → cell"]
     GS --> A
     GS --> B
     GS --> C
-    subgraph A["Cell A · CPU · ~8k nodes"]
+    subgraph A["Cell A · CPU · bounded size"]
         AC["controller + hot standby"]
         AD["accounting / state DB"]
     end
-    subgraph B["Cell B · GPU · ~5k nodes"]
+    subgraph B["Cell B · GPU"]
         BC["controller + hot standby"]
         BD["accounting / state DB"]
     end
-    subgraph C["Cell C · high-mem · ~3k nodes"]
+    subgraph C["Cell C · high-mem"]
         CC["controller + hot standby"]
         CD["accounting / state DB"]
     end
+    A -. "native federation where it fits" .- B
+    B -. "native federation where it fits" .- C
 ```
 
-**Controller HA (per cell):** primary + backup controller sharing **durable state** (in the lab this is
-`StateSaveLocation` on local disk; at scale it's replicated/shared storage). On primary loss the backup
-takes over; running jobs keep running (the execution plane is independent of the controller — proven in
-the lab: killing `slurmctld` didn't kill running work). **Tested failover** is the deliverable, not just
-"we have a backup."
+Cells double as **capability pools** (CPU / GPU / high-mem) and **blast-radius boundaries** — a cell
+outage is not a fleet outage.
 
-**Backpressure:** the submit path must protect the controllers. A regression that fans out to 2M tasks
-should be admitted as a bounded array with a concurrency cap, not 2M individual RPCs. Rate-limit at the
-access plane; reject/queue with clear feedback rather than collapsing.
+**Controller HA (per cell):** primary + backup controller over a **durable, low-latency shared
+`StateSaveLocation`** reachable by both. In the lab that's local disk; at scale the state store must be
+engineered for availability and low latency — SchedMD explicitly warns against ordinary NFS for this
+critical state. On primary loss the backup takes over; running jobs keep running because the execution
+plane is independent of the controller (proven in the lab — killing `slurmctld` didn't kill running
+work). **Tested failover** is the deliverable, not just "a backup exists."
 
-| Choice | Pros | Cons | When |
-|---|---|---|---|
-| One giant cluster | simplest, global view, best packing | single failure domain, RPC/cycle limits, blast radius | small/medium fleets |
-| Many cells + federation | isolation, horizontal scale, capability boundaries | cross-cell fairness is harder, more moving parts, routing logic | large heterogeneous fleets |
-| Fully independent clusters | maximum isolation | no global view, manual balancing, fragmented capacity | multi-org / strict isolation |
+**Backpressure:** the submit path must protect the controllers. A regression fanning out to millions of
+tasks should be admitted as a bounded array with a concurrency cap, not millions of individual RPCs.
+Rate-limit at the admission layer; queue or reject with honest feedback rather than collapsing.
 
-**What breaks at the next 10×:** the *federation layer* and the *accounting DB* become the new
-bottlenecks; global fair-share across cells and cross-cell job routing get expensive. You then shard
-accounting and make fair-share hierarchical.
+| Choice | Pros | Cons |
+|---|---|---|
+| One cluster | simplest, global view, best packing | single failure domain; RPC/cycle limits; large blast radius |
+| Cells + admission/routing layer | isolation, horizontal scale, capability boundaries | cross-cell fairness is harder; more moving parts; routing logic to build |
+| Fully independent clusters | maximum isolation | no global view; manual balancing; fragmented capacity |
 
-**Talking point:** *"A single controller is a scaling and failure-domain limit, so past a few thousand
-nodes I'd federate into cells — also aligning cells with capability classes and blast-radius boundaries
-— behind a routing layer that owns global fair-share. Each cell runs primary+standby with durable state
-and tested failover. The execution plane is deliberately independent of the controller so a control-plane
-failover doesn't kill running jobs."*
+**How I'd choose cell boundaries:** from measured scheduler-cycle time, RPC throughput, queue depth,
+workload churn, capability classes, and the failure blast radius I'm willing to accept — not a fixed
+node count.
+
+**What breaks at the next 10×:** the admission/routing layer and the accounting DB become the new
+bottlenecks; cross-cell fair-share and routing get expensive → shard accounting, make fair-share
+hierarchical.
 
 ---
 
@@ -286,7 +301,8 @@ failover doesn't kill running jobs."*
 
 The execution plane is intentionally **dumb and independent**: each node runs the agent (`slurmd`),
 which forks a per-step `slurmstepd` that joins the cgroup, drops privileges to the user, binds GRES
-(GPUs), and runs the task. A node failing takes only its own work with it — never the fleet.
+(GPUs), and runs the task. Because nodes hold no shared scheduler state, a node failing takes only its
+own running work with it — not the fleet.
 
 But at scale, a node is not "up or down" — it moves through a **lifecycle**, and the lifecycle plane
 (next section) is what drives it:
@@ -320,8 +336,9 @@ Key distinctions that the lab made concrete:
 
 ## 8. Fleet lifecycle controller (with a simulator)
 
-This is the component that turns "I know Slurm" into "I can design the platform *around* a scheduler."
-It is a reconciler (from §5) specialized to node lifecycle. Suggested shape:
+This is the component that turns "I understand Slurm" into "I can design the platform *around* a
+scheduler." It is a reconciler (from §5) specialized to node lifecycle. Suggested shape (a **V3/V4
+design** — not yet built):
 
 ```text
 fleet-controller/
@@ -336,7 +353,7 @@ fleet-controller/
 ```
 
 The decisive design move is a **scheduler adapter interface** with two implementations — the same
-policy and state-machine code drives both:
+policy and state-machine code would drive both:
 
 ```mermaid
 flowchart TB
@@ -346,15 +363,10 @@ flowchart TB
     IF --> SIM["SimulatedFleetAdapter<br/>100,000 in-memory Node objects + fault injection"]
 ```
 
-Why this is powerful: the *integration* is validated against a real cluster (small), while the
-*control-plane behavior* (idempotency, batching, backpressure, remediation dedup) is validated against
-a simulated 100k-node fleet. You never claim a 2-node EC2 box proved physical scale — you prove the
-*architecture* doesn't depend on node count. (See §18 for what to measure.)
-
-**Talking point:** *"I'd separate the lifecycle controller from its scheduler adapter. That gives me a
-real integration path against a small cluster and an in-memory fleet backend for high-cardinality
-testing — so I can exercise thousands of node states and fault events for idempotency, batching, and
-remediation storms without pretending a two-node deployment demonstrated 100k-node scale."*
+Why this is powerful: this design would let the *integration* be validated against a small real cluster,
+while *control-plane behavior* (idempotency, batching, backpressure, remediation dedup) is validated
+against a **simulated** fleet. It never claims a 2-node box proved physical scale — it proves the
+*architecture* doesn't depend on node count. (This is the V4 deliverable; see §18 and the roadmap.)
 
 ---
 
@@ -392,10 +404,10 @@ Design rules that matter at scale:
   classes (some retryable, some = RMA); disk SMART (drain, migrate scratch); thermal (drain, check
   cooling). Different classes → different remediations and different auto/human thresholds.
 
-**Talking point:** *"Draining is cheap to automate; returning to service is a trust decision. I gate
-resume behind N consecutive healthy checks plus remediation completion, use backoff-then-quarantine to
-kill flapping, and put a circuit breaker on the remediation engine so a single bad rule can't drain the
-fleet. Detection, policy, and action are separate services so policy can be dry-run against history."*
+The principle underneath all of it: **draining is cheap to automate; returning to service is a trust
+decision** — gated behind N consecutive healthy checks plus remediation completion, with
+backoff-then-quarantine to kill flapping and a circuit breaker so a single bad rule can't drain the
+fleet.
 
 ---
 
@@ -453,10 +465,10 @@ rebuilds (bake once, boot many) but slower iteration; Ansible-style CM is flexib
 but risks drift and slower convergence. Mature fleets use **images for the base + CM for the last mile**,
 with drift reconciliation catching the gaps.
 
-**Talking point:** *"Terraform owns provisioning; images/Ansible own configuration; both are behind
-Git + CI. I never push to the whole fleet — changes flow staging → canary → 1/10/50/100% with health
-gates and automatic rollback, and a reconciler continuously corrects drift. Rebuild-from-zero is a
-tested capability, not a runbook."*
+**Design summary:** Terraform owns provisioning; images/Ansible own configuration; both sit behind
+Git + CI. Nothing pushes to the whole fleet at once — changes flow staging → canary → 1/10/50/100% with
+health gates and automatic rollback, and a reconciler continuously corrects drift. The **V2 goal** is to
+make rebuild-from-zero a *tested capability* rather than a manual runbook.
 
 ---
 
@@ -498,9 +510,9 @@ flowchart LR
 
 The scheduler must treat licenses as a resource (Slurm `Licenses=`, or an external license-aware
 scheduler) so it doesn't dispatch work that immediately blocks on a token, and so it avoids **license
-starvation** (one team draining the pool). Backfill must be license-aware. **Talking point:** *"On an
-EDA farm the binding constraint is frequently the license pool, not the cluster — I schedule licenses as
-a first-class resource and reason about token fairness, not just CPU fairness."*
+starvation** (one team draining the pool). Backfill must be license-aware. The design consequence: on an
+EDA farm the binding constraint is frequently the **license pool, not the cluster**, so licenses are
+scheduled as a first-class resource and token fairness matters as much as CPU fairness.
 
 **Regressions = throughput control.** A verification regression is a massive job array; the array
 concurrency cap (`--array=…%N`, proven in the lab) is bounded throughput — *analogous to* (not the same
@@ -528,7 +540,7 @@ flowchart TB
     PAR --> DATA["design DBs · toolchains · PDKs · regression logs"]
 ```
 
-Design concerns a staff engineer raises:
+Design concerns worth raising explicitly:
 
 - **Metadata storms & small files.** EDA runs create millions of tiny files; metadata ops (not
   bandwidth) become the bottleneck → parallel FS with strong metadata, and push hot/intermediate I/O to
@@ -573,10 +585,9 @@ minutes."* Breach burns error budget → freeze risky rollouts.
 14:37  scheduler: node-4821 → RESUME
 ```
 
-**Talking point:** *"Automation without observability is just faster ways to break. I'd instrument the
-golden signals for a farm — queue wait, utilization, MTTD/MTTR, remediation success, license wait — put
-SLOs with error budgets on the ones users feel, and keep an immutable audit trail so every job → node →
-fault → remediation is reconstructable. That makes the platform explainable, not just automated."*
+Automation without observability is just faster ways to break: the golden signals, plus SLOs with error
+budgets on the ones users feel, plus an immutable audit trail, are what make the platform
+**explainable** — not merely automated.
 
 ---
 
@@ -619,17 +630,16 @@ The lab's honest shortcuts (public IPs, SSH from one IP, hand-copied MUNGE key) 
 - **Policy-as-code:** security/compliance gates in CI (no `0.0.0.0/0`, required encryption, tagging).
 - **Auditability:** every privileged action is attributable.
 
-**Talking point:** *"At scale I'd remove humans from the trust path: private networking with brokered
-access, central identity with least privilege, secrets (MUNGE, tool licenses) from a rotating managed
-store with audit, and security policy enforced in CI. The lab's single-/32 SSH rule and hand-distributed
-key are deliberately the throwaway versions of exactly these controls."*
+The through-line: **remove humans from the trust path** — brokered access, central identity with least
+privilege, secrets from a rotating managed store with audit, and policy enforced in CI. The lab's
+single-`/32` SSH rule and hand-distributed key are deliberately the throwaway versions of these controls.
 
 ---
 
 ## 17. Capacity, utilization, fairness & backpressure
 
-When the queue is deep, the naive answer is "buy more machines." The staff answer is **diagnose the
-binding constraint first:**
+When the queue is deep, the naive answer is "buy more machines." The disciplined answer is to
+**diagnose the binding constraint first:**
 
 ```mermaid
 flowchart TB
@@ -648,17 +658,18 @@ flowchart TB
   gracefully** (throttle admission, queue with honest feedback) rather than collapse.
 - **Fragmentation:** many small jobs can strand large-job capacity; topology/packing policy matters.
 
-**Talking point:** *"'We need more machines' is a hypothesis, not a conclusion. I'd first attribute
-queue pressure to scheduling, fragmentation, licenses, storage, or broken capacity — often the fix is
-policy or a storage/license bottleneck, not hardware. And I design admission with backpressure so
-overload degrades service instead of taking down the control plane."*
+"We need more machines" is a hypothesis, not a conclusion: queue pressure is first attributed to
+scheduling, fragmentation, licenses, storage, or broken capacity — often the fix is policy or a
+storage/license bottleneck, not hardware. Admission carries backpressure so overload degrades service
+instead of taking down the control plane.
 
 ---
 
 ## 18. Validating the design without 100k machines
 
-The credible answer to *"you only had two workers — how do you know it scales?"* is the
-adapter split from §8: real integration at small scale, control-plane behavior at simulated scale.
+This design answers *"you only had two workers — how do you know it scales?"* with the adapter split
+from §8: real integration at small scale, and control-plane behavior exercised against a **simulated**
+fleet (the V4 deliverable — designed, not yet built).
 
 **Inject into the simulated fleet:**
 
@@ -678,12 +689,12 @@ adapter split from §8: real integration at small scale, control-plane behavior 
 - **Backpressure:** does admission shed load under a task burst instead of collapsing?
 - **Safety:** can a single bad rule drain >X% — and does the circuit breaker stop it?
 
-**Talking point (verbatim-ready):** *"I separated the lifecycle controller from its scheduler adapter.
-The integration is exercised against a real Slurm cluster, but I also built an in-memory fleet backend to
-generate thousands of node states and fault events — so I could test idempotency, batching, backpressure,
-and remediation storms without pretending a two-node deployment demonstrated physical 100k-node scale. At
-real scale I'd then validate scheduler-, network-, and storage-specific behavior against progressively
-larger staging cells."*
+**Framed as design:** the lifecycle controller is separated from its scheduler adapter; the real adapter
+would exercise integration against the small Slurm cluster, while an in-memory backend would generate
+high-cardinality node and fault state to test idempotency, batching, backpressure, and remediation
+storms — so scale is validated *without* claiming a two-node deployment demonstrated physical 100k-node
+scale. At real scale, scheduler-, network-, and storage-specific behavior would then be validated
+against progressively larger staging cells.
 
 ---
 
@@ -724,7 +735,7 @@ The decisions a reviewer will push on — with the alternative and the reasoning
 
 | Decision | Alternatives | Why / tradeoff |
 |---|---|---|
-| Federated cells | one giant cluster | isolation + horizontal scale vs harder global fairness. Chosen past a few-thousand nodes. |
+| Federated cells + routing layer | one giant cluster | isolation + horizontal scale vs harder global fairness. Boundary chosen from measured scheduler load, not a node count. |
 | Separate lifecycle plane from scheduler | bolt health into the scheduler | clean seams, independent scaling, testable via adapter; costs an extra system to run |
 | Reconciliation loops | imperative remediation scripts | self-healing + idempotent + survives restarts vs more upfront design |
 | Drain-worthy auto, resume manual/gated | auto-resume on first healthy | prevents flapping vs slightly slower recovery. Correct default. |
@@ -740,31 +751,31 @@ The decisions a reviewer will push on — with the alternative and the reasoning
 ## 21. Evolution roadmap (mapped to the lab)
 
 What the [`README`](../README.md) already proves, and the ordered path from here. **Depth over
-breadth — do the first three well before anything else.**
+breadth — do the first three well before anything else.** Only V1 is built; V2–V5 are designed.
 
 ```mermaid
 flowchart LR
     V1["V1 — BUILT<br/>3-node Slurm: MUNGE, cons_tres, cgroups,<br/>arrays, deps, drain/resume, slurmd failure,<br/>health-check auto-drain"] --> V2
-    V2["V2<br/>zero-touch rebuild:<br/>Terraform + Ansible/images,<br/>destroy → rebuild automatically"] --> V3
-    V3["V3<br/>fleet lifecycle controller:<br/>state machine + idempotent<br/>scheduler adapter + health/remediation"] --> V4
-    V4["V4<br/>100k-node simulator:<br/>fault injection + metrics<br/>+ backpressure + audit events"] --> V5
-    V5["V5+<br/>config-as-code rollout, controller HA,<br/>federated cells, licenses, storage,<br/>multi-site / DR"]
+    V2["V2 — designed<br/>zero-touch rebuild:<br/>Terraform + Ansible/images,<br/>destroy → rebuild automatically"] --> V3
+    V3["V3 — designed<br/>fleet lifecycle controller:<br/>state machine + idempotent<br/>scheduler adapter + health/remediation"] --> V4
+    V4["V4 — designed<br/>100k-node simulator:<br/>fault injection + metrics<br/>+ backpressure + audit events"] --> V5
+    V5["V5+ — designed<br/>config-as-code rollout, controller HA,<br/>federated cells, licenses, storage,<br/>multi-site / DR"]
 ```
 
-| Stage | Deliverable | Proves |
-|---|---|---|
-| **V1 (built)** | real 3-node cluster, failure drills | "I understand how the scheduler behaves" |
-| V2 | one command rebuilds the cluster from zero | reproducibility, config-as-code, no-SSH ops |
-| V3 | Python reconciler + state machine + adapter | policy/infra separation, idempotency, control loops |
-| V4 | simulate 100k nodes + inject faults + metrics | the architecture scales independent of node count |
-| V5+ | HA, cells, licenses, storage, multi-site, DR | full platform reasoning |
+| Stage | Status | Deliverable | Proves |
+|---|---|---|---|
+| **V1** | **built** | real 3-node cluster, failure drills | "I understand how the scheduler behaves" |
+| V2 | designed | one command rebuilds the cluster from zero | reproducibility, config-as-code, no-SSH ops |
+| V3 | designed | Python reconciler + state machine + adapter | policy/infra separation, idempotency, control loops |
+| V4 | designed | simulate 100k nodes + inject faults + metrics | the architecture scales independent of node count |
+| V5+ | designed | HA, cells, licenses, storage, multi-site, DR | full platform reasoning |
 
 ---
 
 ## 22. How to reason about any fleet problem
 
-The payoff. Given *any* infrastructure/scheduling question, walk the lens from §3 and you sound like a
-staff engineer instead of reciting commands:
+The payoff. Given *any* infrastructure/scheduling question, walk the lens from §3 and you reason from
+structure instead of reciting commands:
 
 ```text
 1  What work are we serving?          → workload shape drives everything (§1)
